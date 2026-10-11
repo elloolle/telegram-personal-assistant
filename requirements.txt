@@ -1,0 +1,4 @@
+Telethon==1.45.0
+python-dotenv==1.2.1
+opentele2==1.2.1
+qrcode==8.2
