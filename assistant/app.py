@@ -22,7 +22,7 @@ MUTE_FOREVER = 2**31 - 1
 SCENARIO = "Стикер + ГС1 + ГС2"
 MENU = [[Button.text("⚙️ Настройка"), Button.text("📋 Статус")],
         [Button.text("⏸ Пауза"), Button.text("▶️ Продолжить")],
-        [Button.text("❌ Отменить отправку")]]
+        [Button.text("📨 Очередь")]]
 SENDING = ("sticker_pending", "voice_pending", "second_pending")
 WAITING = ("reply_waiting", "second_confirmation")
 STAGES = {"awaiting_confirmation": "вы уже писали этому человеку: требуется подтверждение",
@@ -85,6 +85,7 @@ class Assistant:
         self.owner_id = owner_id
         self.folders = Folders(user)
         self.locks = defaultdict(asyncio.Lock)
+        self.queue_lock = asyncio.Lock()
         self.ready = False
         self.last_history_scan = 0
         self.wake = asyncio.Event()
@@ -138,7 +139,8 @@ class Assistant:
                                 "Откройте чат, ответьте человеку, затем нажмите кнопку.\n"
                                 "При запрете голосовых ничего дополнительно не отправляю.\n"
                                 "Чаты архивируются, уведомления отключаются. Повторный username запрашивает подтверждение повтора.\n"
-                                "/settings, /status, /version, /pause, /resume, /cancel ID, /retry ID.", buttons=MENU)
+                                "«📨 Очередь» → до 5 или все запросы подтверждения ГС2.\n"
+                                "/settings, /queue, /status, /version, /pause, /resume, /cancel ID, /retry ID.", buttons=MENU)
             elif text == "/version":
                 await self.tell(f"Помощник v{__version__}. Режим: {SCENARIO}.")
             elif text in ("⚙️ Настройка", "/settings", "🔀 Режим переписки"):
@@ -146,6 +148,8 @@ class Assistant:
                 await self.settings()
             elif text in ("📋 Статус", "/status"):
                 await self.status()
+            elif text in ("📨 Очередь", "/queue"):
+                await self.queue_menu()
             elif text in ("⏸ Пауза", "/pause"):
                 self.store.set("paused", True)
                 for job in self.store.jobs():
@@ -162,9 +166,6 @@ class Assistant:
             elif re.fullmatch(r"/(cancel|retry) \d+", text):
                 action, job_id = text.split()
                 await self.job_action(action, int(job_id))
-            elif text == "❌ Отменить отправку":
-                await self.status()
-                await self.tell("Чтобы отменить задание: /cancel ID. ID указан в статусе.")
             elif text == "/cancel":
                 self.store.set("mode", None)
                 await self.tell("Ввод настройки отменён. Для отмены задания: /cancel ID.", buttons=MENU)
@@ -197,11 +198,11 @@ class Assistant:
             elif data == "scenario:two_voice":
                 self.store.set("mode", None)
                 await self.scenario_settings()
+            elif data in ("queue:five", "queue:all"):
+                await self.send_queue_requests(5 if data == "queue:five" else None)
             elif re.fullmatch(r"send_second:\d+:\d+", data):
                 _, job_id, token = data.split(":")
                 await self.confirm_second(int(job_id), int(token))
-            elif re.fullmatch(r"second_cancel:\d+", data):
-                await self.job_action("/cancel", int(data.split(":")[1]))
             elif re.fullmatch(r"repeat_(confirm|cancel):\d+:\d+", data):
                 action, job_id, token = data.split(":")
                 await self.repeat_action(action, int(job_id), int(token))
@@ -397,19 +398,59 @@ class Assistant:
 
     async def notify_second(self, job, *, force=False):
         if job["stage"] != "second_confirmation":
-            return
+            return False
         if not force and (job["second_send_notified"] or job["second_notice_try"] > time.time()):
-            return
+            return False
         self.store.update(job["id"], second_notice_try=time.time() + 30)
-        question = "\n⚠️ В ответе есть вопрос." if job["second_question"] > job["second_approved"] else ""
-        sent = await self.tell(f"@{job['username']} ответил(а) после ГС1. Задание #{job['id']}.{question}\n"
+        sent = await self.tell(f"@{job['username']} ответил(а) после ГС1. Задание #{job['id']}.\n"
                                "Откройте переписку и ответьте человеку. Затем вернитесь сюда и нажмите «Отправить ГС2». "
                                "До вашего нажатия ГС2 не отправляется.",
                                buttons=[[Button.url("Открыть переписку", f"https://t.me/{job['username']}")],
-                                        [Button.inline("🎙 Отправить ГС2", f"send_second:{job['id']}:{job['second_token']}".encode())],
-                                        [Button.inline("Отменить задание", f"second_cancel:{job['id']}".encode())]])
+                                        [Button.inline("🎙 Отправить ГС2", f"send_second:{job['id']}:{job['second_token']}".encode())]])
         if sent:
             self.store.update(job["id"], second_send_notified=1)
+        return sent
+
+    def second_queue(self):
+        return [job for job in reversed(self.store.jobs())
+                if job["stage"] == "second_confirmation" and job["desired_folder"] == 2
+                and job["applied_folder"] == 2 and not job["second_send_approved"]]
+
+    async def queue_menu(self):
+        count = len(self.second_queue())
+        await self.tell(f"📨 Очередь ГС2: {count} в папке «В процессе 2» ждут вашего подтверждения.\n"
+                        "Выберите, сколько отдельных запросов с username и кнопкой «Отправить ГС2» прислать вам. "
+                        "Каждое голосовое по-прежнему требует вашего нажатия в своём запросе.",
+                        buttons=[[Button.inline("Отправить до 5 запросов", b"queue:five")],
+                                 [Button.inline("Отправить все запросы", b"queue:all")]])
+
+    async def send_queue_requests(self, limit):
+        if self.queue_lock.locked():
+            await self.tell("Запросы из очереди уже отправляются. Дождитесь окончания.")
+            return
+        async with self.queue_lock:
+            jobs = self.second_queue()
+            if limit is not None:
+                jobs = jobs[:limit]
+            if not jobs:
+                await self.tell("В папке «В процессе 2» нет заданий, ожидающих подтверждения ГС2.")
+                return
+            sent = 0
+            for index, snapshot in enumerate(jobs):
+                if index:
+                    await asyncio.sleep(1.1)
+                async with self.locks[snapshot["user_id"]]:
+                    job = self.store.job(snapshot["id"])
+                    if (not job or job["stage"] != "second_confirmation" or job["desired_folder"] != 2
+                            or job["applied_folder"] != 2 or job["second_send_approved"]):
+                        continue
+                    if not await self.notify_second(job, force=True):
+                        await self.tell(f"Отправлено запросов: {sent}. Доставка прервалась; повторите через «Очередь» позже.")
+                        return
+                    sent += 1
+            await asyncio.sleep(1.1)
+            await self.tell(f"Отправлено запросов подтверждения ГС2: {sent}. "
+                            "Откройте чаты и подтвердите нужные голосовые отдельными кнопками.")
 
     async def confirm_second(self, job_id, token):
         job = self.store.job(job_id)
@@ -427,7 +468,7 @@ class Assistant:
                 await self.notify_second(job, force=True)
                 return
             self.store.update(job_id, stage="second_pending", second_send_approved=1,
-                              second_approved=job["second_question"], error="", next_try=0)
+                              error="", next_try=0)
             self.store.reset_gate(job_id)
             await self.tell(f"#{job_id}: ГС2 подтверждено. Прочитаю входящие, подожду 3 секунды, покажу запись и отправлю ГС2.")
 
@@ -496,13 +537,6 @@ class Assistant:
         if (job["stage"] in WAITING + ("second_pending",) and job["second_baseline"]
                 and message.id > job["second_baseline"]):
             changes["second_reply"] = max(job["second_reply"], message.id)
-            text = message.message or ""
-            question = any(mark in text for mark in ("?", "？", "؟"))
-            if question and message.id > job["second_question"]:
-                changes.update(second_question=message.id)
-                if job["stage"] in ("second_confirmation", "second_pending"):
-                    changes.update(stage="second_confirmation", second_send_approved=0,
-                                   second_token=job["second_token"] + 1, second_send_notified=0, second_notice_try=0)
             if job["stage"] == "reply_waiting":
                 changes.update(stage="second_confirmation", second_send_approved=0,
                                second_token=job["second_token"] + 1, second_send_notified=0, second_notice_try=0)

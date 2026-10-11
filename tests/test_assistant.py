@@ -267,7 +267,7 @@ class ScenarioTests(unittest.IsolatedAsyncioTestCase):
                          and isinstance(request.action, types.SendMessageCancelAction))
         self.assertLess(sent, cancelled)
 
-    async def test_question_received_during_final_privacy_check_blocks_second_voice(self):
+    async def test_question_during_final_check_keeps_approval_but_waits_after_reading(self):
         await self.first()
         await self.receive(1100)
         await self.approve()
@@ -281,10 +281,12 @@ class ScenarioTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(self.app, 'voice_allowed', side_effect=question_during_request):
             await self.tick(11)
-        self.assertEqual(self.state()['stage'], 'second_confirmation')
-        self.assertFalse(self.state()['second_send_approved'])
+        self.assertEqual(self.state()['stage'], 'second_pending')
+        self.assertTrue(self.state()['second_send_approved'])
         self.assertFalse(self.state()['recording_kind'])
         self.assertEqual(len(self.user.sent), 2)
+        await self.tick(3)
+        self.assertEqual(len(self.user.sent), 3)
 
     async def test_long_voice_does_not_poll_history_every_second_and_still_reads_before_send(self):
         self.store.update(self.job['id'], first_duration=109)
@@ -314,7 +316,7 @@ class ScenarioTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(3)
         self.assertEqual(len(self.user.sent), 2)
 
-    async def test_long_second_voice_checks_missed_question_before_delivery(self):
+    async def test_long_second_voice_reads_missed_question_without_revoking_approval(self):
         await self.first()
         await self.receive(1100)
         await self.approve()
@@ -329,9 +331,11 @@ class ScenarioTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(self.user.history_queries) - queries, 3)
         await self.receive(1101, 'Почему?', live=False)
         await self.tick(1)
-        self.assertEqual(self.state()['stage'], 'second_confirmation')
-        self.assertFalse(self.state()['second_send_approved'])
+        self.assertEqual(self.state()['stage'], 'second_pending')
+        self.assertTrue(self.state()['second_send_approved'])
         self.assertEqual(len(self.user.sent), 2)
+        await self.tick(3)
+        self.assertEqual(len(self.user.sent), 3)
 
     async def test_new_reply_before_sticker_restarts_three_seconds_and_reads_old_history(self):
         self.user.history[123] = [incoming(50), incoming(100)]
@@ -422,22 +426,144 @@ class ScenarioTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(100)
         self.assertEqual(len(self.user.sent), 3)
 
-    async def test_new_question_during_second_recording_revokes_approval(self):
+    async def test_question_marks_during_second_recording_keep_approval_and_timer(self):
         await self.first()
         await self.receive(1100)
         await self.approve()
         await self.tick()
         await self.tick(3)
         old_token = self.state()['second_token']
-        await self.receive(1101, 'А почему?')
-        self.assertEqual(self.state()['stage'], 'second_confirmation')
-        self.assertFalse(self.state()['recording_kind'])
+        deadline = self.state()['recording_until']
+        await self.receive(1101, 'А почему? ？ ؟')
+        self.assertEqual(self.state()['stage'], 'second_pending')
+        self.assertTrue(self.state()['recording_kind'])
+        self.assertTrue(self.state()['second_send_approved'])
+        self.assertEqual(self.state()['recording_until'], deadline)
+        self.assertEqual(self.state()['second_token'], old_token)
         await self.callback(f"send_second:{self.job['id']}:{old_token}")
-        await self.tick(100)
-        self.assertEqual(len(self.user.sent), 2)
-        await self.approve()
         await self.finish_second()
         self.assertEqual(len(self.user.sent), 3)
+
+    async def test_question_before_approval_does_not_warn_or_invalidate_existing_button(self):
+        await self.first()
+        await self.receive(1100, 'Почему?')
+        token = self.state()['second_token']
+        notices = self.bot.send_message.call_count
+        await self.receive(1101, 'Когда？ Как؟')
+        self.assertEqual(self.state()['second_token'], token)
+        self.assertEqual(self.bot.send_message.call_count, notices)
+        self.assertFalse(any('В ответе есть вопрос' in call.args[1] for call in self.bot.send_message.call_args_list))
+        await self.callback(f"send_second:{self.job['id']}:{token}")
+        self.assertTrue(self.state()['second_send_approved'])
+
+    def add_queue_job(self, user_id, stage='second_confirmation', folder=2):
+        job = self.store.add(user_id=user_id, access_hash=55, username=f'user{user_id}',
+                             sticker_source=10, voice_source=11, second_source=12, baseline=100,
+                             first_duration=7, second_duration=11, history_checked=True)
+        self.store.update(job['id'], stage=stage, desired_folder=2, applied_folder=folder,
+                          second_baseline=1001, second_reply=1100, second_token=1,
+                          second_send_approved=int(stage == 'second_pending'))
+        return self.store.job(job['id'])
+
+    def queue_prompts(self):
+        return [call for call in self.bot.send_message.call_args_list if 'ответил(а) после ГС1' in call.args[1]]
+
+    async def test_queue_menu_has_two_options_and_replaces_cancel_button(self):
+        self.add_queue_job(456)
+        await self.command('/start')
+        menu = [button.button.text for row in self.bot.send_message.call_args.kwargs['buttons'] for button in row]
+        self.assertIn('📨 Очередь', menu)
+        self.assertNotIn('❌ Отменить отправку', menu)
+        await self.command('📨 Очередь')
+        self.assertIn('Очередь ГС2: 1', self.bot.send_message.call_args.args[1])
+        buttons = [button.type.data for row in self.bot.send_message.call_args.kwargs['buttons'] for button in row]
+        self.assertEqual(buttons, [b'queue:five', b'queue:all'])
+        self.assertEqual(self.queue_prompts(), [])
+        self.assertEqual(self.user.sent, [])
+        self.assertEqual(self.user.history_queries, [])
+
+    async def test_queue_five_sends_oldest_five_separate_prompts_without_voice_approval(self):
+        jobs = [self.add_queue_job(user_id) for user_id in range(456, 463)]
+        self.add_queue_job(500, stage='second_pending')
+        self.add_queue_job(501, stage='reply_waiting')
+        self.add_queue_job(502, stage='second_done')
+        self.add_queue_job(503, folder=1)
+        with patch('assistant.app.asyncio.sleep', new_callable=AsyncMock):
+            await self.callback('queue:five')
+        prompts = self.queue_prompts()
+        self.assertEqual(len(prompts), 5)
+        self.assertEqual([call.kwargs['buttons'][1][0].type.data for call in prompts],
+                         [f"send_second:{job['id']}:1".encode() for job in jobs[:5]])
+        self.assertTrue(all(len(call.kwargs['buttons']) == 2 for call in prompts))
+        self.assertTrue(all(not self.store.job(job['id'])['second_send_approved'] for job in jobs))
+        self.assertEqual(self.user.sent, [])
+        await self.callback(f"send_second:{jobs[0]['id']}:1")
+        self.assertEqual(self.store.job(jobs[0]['id'])['stage'], 'second_pending')
+        self.assertEqual(len(self.app.second_queue()), 6)
+        self.assertTrue(all(self.store.job(job['id'])['stage'] == 'second_confirmation' for job in jobs[1:]))
+
+    async def test_queue_all_resends_existing_prompts_with_pacing_and_no_media_sends(self):
+        jobs = [self.add_queue_job(user_id) for user_id in range(456, 463)]
+        for job in jobs:
+            self.store.update(job['id'], second_send_notified=1)
+        with patch('assistant.app.asyncio.sleep', new_callable=AsyncMock) as sleep:
+            await self.callback('queue:all')
+        self.assertEqual(len(self.queue_prompts()), 7)
+        self.assertEqual(sleep.await_count, 7)
+        self.assertTrue(all(call.args == (1.1,) for call in sleep.await_args_list))
+        self.assertEqual(self.user.sent, [])
+        self.assertTrue(all(self.store.job(job['id'])['stage'] == 'second_confirmation' for job in jobs))
+
+    async def test_empty_queue_and_unauthorized_queue_click_send_no_prompts(self):
+        await self.callback('queue:five')
+        self.assertIn('нет заданий', self.bot.send_message.call_args.args[1])
+        self.add_queue_job(456)
+        await self.callback('queue:all', sender=999)
+        self.assertEqual(self.queue_prompts(), [])
+        self.assertEqual(self.user.sent, [])
+
+    async def test_queue_skips_job_approved_during_batch(self):
+        first = self.add_queue_job(456)
+        second = self.add_queue_job(457)
+
+        async def approve_between_prompts(seconds):
+            await self.callback(f"send_second:{second['id']}:1")
+
+        with patch('assistant.app.asyncio.sleep', side_effect=approve_between_prompts):
+            await self.callback('queue:all')
+        self.assertEqual(len(self.queue_prompts()), 1)
+        self.assertIn(f"#{first['id']}", self.queue_prompts()[0].args[1])
+        self.assertEqual(self.store.job(second['id'])['stage'], 'second_pending')
+
+    async def test_queue_delivery_failure_stops_batch_without_approving_any_voice(self):
+        jobs = [self.add_queue_job(456), self.add_queue_job(457)]
+        self.bot.send_message.side_effect = ConnectionError('offline')
+        with patch('assistant.app.asyncio.sleep', new_callable=AsyncMock):
+            await self.callback('queue:all')
+        self.assertEqual(len(self.queue_prompts()), 1)
+        self.assertTrue(all(self.store.job(job['id'])['stage'] == 'second_confirmation' for job in jobs))
+        self.assertFalse(self.store.job(jobs[0]['id'])['second_send_notified'])
+
+    async def test_queue_rejects_concurrent_batch_and_obsolete_cancel_button(self):
+        job = self.add_queue_job(456)
+        async with self.app.queue_lock:
+            await self.callback('queue:all')
+        self.assertIn('уже отправляются', self.bot.send_message.call_args.args[1])
+        self.assertEqual(self.queue_prompts(), [])
+        await self.callback(f"second_cancel:{job['id']}")
+        self.assertEqual(self.store.job(job['id'])['stage'], 'second_confirmation')
+
+    async def test_queue_survives_restart_and_excludes_completed_or_replaced_jobs(self):
+        waiting = self.add_queue_job(456)
+        self.add_queue_job(457, stage='cancelled')
+        self.add_queue_job(458, stage='voice_forbidden')
+        self.store.close()
+        self.store = Store(self.path)
+        self.app.store = self.store
+        with patch('assistant.app.asyncio.sleep', new_callable=AsyncMock):
+            await self.callback('queue:all')
+        self.assertEqual(len(self.queue_prompts()), 1)
+        self.assertIn(f"#{waiting['id']}", self.queue_prompts()[0].args[1])
 
     async def test_regular_new_reply_during_second_does_not_revoke_but_restarts_read_wait(self):
         await self.first()
