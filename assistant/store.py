@@ -6,7 +6,15 @@ import sqlite3
 import time
 
 
+def validate_opening_text(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError('Пришлите непустой текст первого сообщения.')
+    if len(text.encode('utf-16-le')) // 2 > 4096:
+        raise ValueError('Текст первого сообщения слишком длинный: максимум 4096 символов Telegram.')
+
+
 COLUMNS = {
+    'manual_third_only': 'INTEGER NOT NULL DEFAULT 0',
     'voice_delay': 'REAL',
     'desired_folder': 'INTEGER NOT NULL DEFAULT 0',
     'applied_folder': 'INTEGER NOT NULL DEFAULT 0',
@@ -31,6 +39,7 @@ COLUMNS = {
     'read_gate_id': 'INTEGER NOT NULL DEFAULT -1',
     'read_gate_at': 'REAL',
     'dialogue_mode': "TEXT NOT NULL DEFAULT 'two_voice'",
+    # Legacy "second" fields retain the confirmed final voice, now labelled ГС3.
     'second_source': 'INTEGER',
     'second_random': 'INTEGER NOT NULL DEFAULT 0',
     'second_message': 'INTEGER',
@@ -44,6 +53,10 @@ COLUMNS = {
     'second_notice_try': 'REAL NOT NULL DEFAULT 0',
     'first_duration': 'REAL',
     'second_duration': 'REAL',
+    'followup_source': 'INTEGER',
+    'followup_duration': 'REAL',
+    'followup_random': 'INTEGER NOT NULL DEFAULT 0',
+    'followup_message': 'INTEGER',
     'recording_kind': "TEXT NOT NULL DEFAULT ''",
     'recording_until': 'REAL NOT NULL DEFAULT 0',
     'recording_next': 'REAL NOT NULL DEFAULT 0',
@@ -51,6 +64,15 @@ COLUMNS = {
     'notice_pending': 'INTEGER NOT NULL DEFAULT 0',
     'notice_try': 'REAL NOT NULL DEFAULT 0',
     'sticker_message': 'INTEGER',
+    'opening_kind': "TEXT NOT NULL DEFAULT 'sticker'",
+    'opening_text': "TEXT NOT NULL DEFAULT ''",
+    'opening_attempted': 'INTEGER NOT NULL DEFAULT 0',
+    'circle_state': "TEXT NOT NULL DEFAULT ''",
+    'circle_source': 'INTEGER',
+    'circle_duration': 'REAL',
+    'circle_random': 'INTEGER NOT NULL DEFAULT 0',
+    'circle_message': 'INTEGER',
+    'circle_token': 'INTEGER NOT NULL DEFAULT 0',
     'voice_message': 'INTEGER',
 }
 
@@ -92,6 +114,11 @@ class Store:
                 self.db.execute(f'ALTER TABLE jobs ADD COLUMN {name} {declaration}')
         self.db.commit()
         self.migrate_scenario_once()
+        if not self.get('single_process_folder_rows', False):
+            with self.db:
+                self.db.execute('UPDATE jobs SET desired_folder=0 WHERE desired_folder=1')
+                self.db.execute('UPDATE jobs SET applied_folder=0 WHERE applied_folder=1')
+                self.db.execute('INSERT OR REPLACE INTO settings VALUES (?, ?)', ('single_process_folder_rows', 'true'))
 
     def get(self, key, default=None):
         row = self.db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
@@ -131,20 +158,35 @@ class Store:
         return self.job(job_id)
 
     def _insert_job(self, *, user_id, access_hash, username, sticker_source, voice_source, second_source,
-            baseline, first_duration=None, second_duration=None, stage='sticker_pending', history_checked=False):
+            baseline, first_duration=None, second_duration=None, stage='sticker_pending', history_checked=False,
+            dialogue_mode='two_voice', followup_source=None, followup_duration=None,
+            opening_kind='sticker', opening_text=''):
         if stage not in ('sticker_pending', 'awaiting_confirmation') or not second_source:
-            raise ValueError('Задайте стикер, ГС1 и ГС2.')
-        for duration in (first_duration, second_duration):
+            raise ValueError('Задайте первое сообщение, ГС1 и ГС3.')
+        if opening_kind not in ('sticker', 'text'):
+            raise ValueError('Выберите текст или стикер для первого сообщения.')
+        if opening_kind == 'text':
+            validate_opening_text(opening_text)
+        elif not sticker_source:
+            raise ValueError('Задайте стикер для первого сообщения.')
+        if dialogue_mode not in ('two_voice', 'three_voice'):
+            raise ValueError('Неизвестный порядок отправки голосовых.')
+        if dialogue_mode == 'three_voice' and not followup_source:
+            raise ValueError('Для пары ГС1 + ГС2 задайте ГС2.')
+        for duration in (first_duration, second_duration, followup_duration):
             if duration is not None and (duration < 0 or not math.isfinite(duration)):
                 raise ValueError('Некорректная длительность голосового.')
         cursor = self.db.execute('''
                 INSERT INTO jobs (user_id, access_hash, username, sticker_source, voice_source,
                   second_source, sticker_random, voice_random, second_random, baseline, started,
-                  cancel_on_reply, dialogue_mode, first_duration, second_duration, stage, history_checked)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'two_voice', ?, ?, ?, ?)
+                  cancel_on_reply, dialogue_mode, first_duration, second_duration, stage, history_checked,
+                  followup_source, followup_duration, followup_random, opening_kind, opening_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (user_id, access_hash, username, sticker_source, voice_source, second_source,
                   secrets.randbits(63), secrets.randbits(63), secrets.randbits(63), baseline,
-                  time.time(), first_duration, second_duration, stage, int(history_checked)))
+                  time.time(), dialogue_mode, first_duration, second_duration, stage, int(history_checked),
+                  followup_source, followup_duration, secrets.randbits(63), opening_kind,
+                  opening_text if opening_kind == 'text' else ''))
         return cursor.lastrowid
 
     def request_repeat(self, job_id, payload):
@@ -183,6 +225,31 @@ class Store:
 
     def by_user(self, user_id):
         return self.db.execute('SELECT * FROM jobs WHERE user_id=?', (user_id,)).fetchone()
+
+    def by_username(self, username):
+        return self.db.execute('SELECT * FROM jobs WHERE username = ? COLLATE NOCASE', (username,)).fetchone()
+
+    def add_manual_third(self, *, user_id, access_hash, username, source, duration, baseline):
+        if not source or duration < 0 or not math.isfinite(duration):
+            raise ValueError('Задайте ГС3 с корректной длительностью.')
+        with self.db:
+            old = self.by_user(user_id)
+            if old:
+                if old['stage'] not in ('second_done', 'done', 'replied', 'cancelled', 'voice_forbidden') or old['circle_state'] == 'pending':
+                    raise ValueError('Для этого пользователя уже есть незавершённое задание.')
+                self.db.execute('INSERT OR REPLACE INTO job_history VALUES (?, ?, ?)',
+                                (old['id'], time.time(), json.dumps(dict(old))))
+                self.db.execute('DELETE FROM repeat_requests WHERE job_id=?', (old['id'],))
+                self.db.execute('DELETE FROM jobs WHERE id=?', (old['id'],))
+            cursor = self.db.execute('''
+                INSERT INTO jobs (user_id, access_hash, username, sticker_source, voice_source,
+                    sticker_random, voice_random, baseline, started, stage, cancel_on_reply,
+                    second_source, second_duration, second_random, second_baseline,
+                    second_send_approved, second_token, history_checked, history_confirmed, manual_third_only)
+                VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, 'second_pending', 0, ?, ?, ?, ?, 1, 1, 1, 1, 1)
+            ''', (user_id, access_hash, username, secrets.randbits(63), secrets.randbits(63), baseline,
+                  time.time(), source, duration, secrets.randbits(63), baseline))
+        return self.job(cursor.lastrowid)
 
     def jobs(self):
         return self.db.execute('SELECT * FROM jobs ORDER BY id DESC').fetchall()
