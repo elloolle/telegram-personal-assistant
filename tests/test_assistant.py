@@ -947,7 +947,147 @@ class ScenarioTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(3)
         self.assertEqual(self.user.sent, [])
         self.assertEqual(self.state()['stage'], 'sticker_pending')
-        self.assertEqual(self.store.get('send_not_before'), self.clock[0] + 21)
+        self.assertEqual(self.store.get('send_not_before'), self.clock[0] + 120)
+
+    async def test_repeated_flood_waits_increase_persistent_cooldown_and_respect_longer_server_wait(self):
+        for expected in (120, 240, 480, 960, 1800, 1800):
+            exc = errors.FloodWaitError(request=None, capture=15)
+            self.assertEqual(self.app.defer_for_flood(exc), expected)
+            self.clock[0] = self.store.get('send_not_before') + 1
+        self.assertEqual(self.app.defer_for_flood(errors.FloodWaitError(request=None, capture=4000)), 4001)
+
+    async def test_duplicate_limit_during_same_cooldown_does_not_shorten_or_double_it(self):
+        self.app.defer_for_flood(errors.FloodWaitError(request=None, capture=15))
+        deadline = self.store.get('send_not_before')
+        strikes = self.store.get('flood_strikes')
+        self.clock[0] += 20
+        self.assertEqual(self.app.defer_for_flood(errors.FloodWaitError(request=None, capture=15)), 100)
+        self.assertEqual(self.store.get('send_not_before'), deadline)
+        self.assertEqual(self.store.get('flood_strikes'), strikes)
+
+    async def test_flood_cooldown_survives_restart_and_resets_after_quiet_period(self):
+        self.app.defer_for_flood(errors.FloodWaitError(request=None, capture=15), self.job['id'])
+        deadline = self.store.get('send_not_before')
+        self.store.close()
+        self.store = Store(self.path)
+        self.app.store = self.store
+        self.assertEqual(self.store.get('send_not_before'), deadline)
+        queries = len(self.user.history_queries)
+        await self.tick(119)
+        self.assertEqual(len(self.user.history_queries), queries)
+        self.assertEqual(self.user.sent, [])
+        self.clock[0] += 1801
+        self.assertEqual(self.app.defer_for_flood(errors.FloodWaitError(request=None, capture=15)), 120)
+
+    async def test_after_cooldown_job_retries_same_message_without_duplicate_or_extra_confirmation(self):
+        await self.tick()
+        random_id = self.state()['sticker_random']
+        self.user.failures[functions.users.GetFullUserRequest] = errors.FloodWaitError(request=None, capture=15)
+        await self.tick(3)
+        queries = len(self.user.history_queries)
+        await self.tick(119)
+        self.assertEqual(len(self.user.history_queries), queries)
+        self.assertEqual(self.user.sent, [])
+        await self.tick(1)
+        await self.tick(3)
+        self.assertEqual(len(self.user.sent), 1)
+        self.assertEqual(self.user.sent[0][1].random_id, [random_id])
+        self.assertEqual(self.state()['stage'], 'voice_pending')
+
+    async def test_cooldown_blocks_reads_maintenance_and_typing_requests(self):
+        self.store.update(self.job['id'], mute_pending=1, archive_pending=1, desired_folder=2,
+                          recording_kind='voice', recording_next=self.clock[0])
+        self.app.defer_for_flood(errors.FloodWaitError(request=None, capture=15))
+        before = len(self.user.operations)
+        await self.app.sync_mute(self.state())
+        await self.app.sync_archive(self.state())
+        await self.app.sync_folder(self.state())
+        await self.app.sync_reads(self.state())
+        await self.app.refresh_recording(self.job['id'], force=True)
+        await self.app.recover_replies(limit=1)
+        await self.tick()
+        self.assertEqual(len(self.user.operations), before)
+        self.assertEqual(self.user.history_queries, [])
+
+    async def test_background_recovery_checks_one_chat_at_a_time_and_rotates_cursor(self):
+        for user_id in (456, 457, 458):
+            self.add_queue_job(user_id, stage='reply_waiting')
+        for user_id in range(500, 540):
+            self.add_queue_job(user_id)
+        for _ in range(4):
+            await self.app.recover_replies(limit=1)
+        self.assertEqual([user_id for _, user_id in self.user.history_queries], [456, 457, 458, 456])
+
+    async def test_background_history_limit_also_uses_long_cooldown_and_notifies_owner(self):
+        self.add_queue_job(456, stage='reply_waiting')
+        async def limited_history(peer, **kwargs):
+            raise errors.FloodWaitError(request=None, capture=15)
+            yield
+        with patch.object(self.user, 'iter_messages', side_effect=limited_history):
+            await self.app.recover_replies(limit=1)
+        self.assertEqual(self.store.get('send_not_before'), self.clock[0] + 120)
+        self.assertIn('Пауза 120 сек.', self.bot.send_message.call_args.args[1])
+        await self.tick(119)
+        self.assertEqual(self.user.sent, [])
+
+    async def test_worker_runs_sending_jobs_before_single_background_check(self):
+        self.add_queue_job(456, stage='reply_waiting')
+        events = []
+        async def process(job_id):
+            events.append(job_id)
+        async def recover(limit=None):
+            events.append(('history', limit))
+        async def end_iteration(awaitable, **kwargs):
+            awaitable.close()
+            raise asyncio.CancelledError
+        with patch.object(self.app, 'process_job', side_effect=process), \
+                patch.object(self.app, 'recover_replies', side_effect=recover), \
+                patch('assistant.app.asyncio.wait_for', side_effect=end_iteration):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.app.worker()
+        self.assertEqual(events[0], self.job['id'])
+        self.assertEqual(events[-1], ('history', 1))
+        self.assertEqual(events.count(('history', 1)), 1)
+
+    async def test_worker_restart_during_cooldown_does_not_run_history_or_queue_requests(self):
+        self.app.defer_for_flood(errors.FloodWaitError(request=None, capture=15))
+        async def end_iteration(awaitable, **kwargs):
+            awaitable.close()
+            raise asyncio.CancelledError
+        with patch.object(self.app, 'recover_replies', new_callable=AsyncMock) as recover, \
+                patch.object(self.app, 'process_job', new_callable=AsyncMock) as process, \
+                patch('assistant.app.asyncio.wait_for', side_effect=end_iteration):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.app.worker()
+        recover.assert_not_awaited()
+        process.assert_not_awaited()
+
+    async def test_recording_interrupted_by_global_cooldown_restarts_for_full_duration(self):
+        await self.sticker()
+        await self.tick(1)
+        self.assertEqual(self.state()['recording_kind'], 'voice')
+        random_id = self.state()['voice_random']
+        self.app.defer_for_flood(errors.FloodWaitError(request=None, capture=15))
+        self.clock[0] += 120
+        await self.app.reset_after_flood()
+        self.assertEqual(self.state()['recording_kind'], '')
+        self.assertIsNone(self.state()['read_gate_at'])
+        await self.tick()
+        await self.tick(1)
+        start = self.clock[0]
+        await self.tick(6.999)
+        self.assertEqual(len(self.user.sent), 1)
+        await self.tick(.001)
+        self.assertEqual(self.user.sent[-1][0] - start, 7)
+        self.assertEqual(self.user.sent[-1][1].random_id, [random_id])
+
+    async def test_status_reports_real_cooldown_and_manual_retry_cannot_bypass_it(self):
+        self.app.defer_for_flood(errors.FloodWaitError(request=None, capture=15), self.job['id'])
+        await self.command('/retry 1')
+        await self.app.status()
+        self.assertIn('осталось 120 сек.', self.bot.send_message.call_args.args[1])
+        await self.tick(119)
+        self.assertEqual(self.user.sent, [])
 
     async def test_transient_send_failure_retains_random_id_and_rereads_before_retry(self):
         await self.tick()

@@ -22,6 +22,9 @@ READ_DELAY = 3
 FOLLOWUP_DELAY = 1
 FIRST_VOICE_DELAY = 1
 RECORD_INTERVAL = 3
+FLOOD_MIN_WAIT = 120
+FLOOD_MAX_WAIT = 1800
+HISTORY_RECHECK_INTERVAL = 15
 MUTE_FOREVER = 2**31 - 1
 SCENARIO = "Текст или стикер + ГС1 + ГС2 + ГС3"
 VOICE_MODES = {"two_voice": "Старый: ГС1; ГС3 вручную по username",
@@ -126,7 +129,6 @@ class Assistant:
         self.recording_tasks = {}
         self.recording_locks = defaultdict(asyncio.Lock)
         self.ready = False
-        self.last_history_scan = 0
         self.wake = asyncio.Event()
         self.user.add_event_handler(self.on_incoming, events.NewMessage(incoming=True))
         self.bot.add_event_handler(self.on_message, events.NewMessage(incoming=True))
@@ -140,6 +142,38 @@ class Assistant:
         except Exception as exc:
             log.warning("Owner notification failed: %s", type(exc).__name__)
             return False
+
+    def defer_for_flood(self, exc, job_id=None):
+        now = time.time()
+        previous = self.store.get("send_not_before", 0)
+        strikes = self.store.get("flood_strikes", 0)
+        if previous <= now:
+            if now - max(previous, self.store.get("flood_last_at", 0)) >= 1800:
+                strikes = 0
+            strikes += 1
+            adaptive = min(FLOOD_MAX_WAIT, FLOOD_MIN_WAIT * 2 ** min(strikes - 1, 4))
+            deadline = now + max(exc.seconds + 1, adaptive)
+        else:
+            deadline = max(previous, now + exc.seconds + 1)
+        with self.store.db:
+            values = {"send_not_before": deadline, "flood_strikes": strikes,
+                      "flood_last_at": now, "flood_reset_pending": True,
+                      "history_scan_next": deadline + HISTORY_RECHECK_INTERVAL}
+            for key, value in values.items():
+                self.store.db.execute('INSERT OR REPLACE INTO settings VALUES (?, ?)', (key, json.dumps(value)))
+        if job_id is not None:
+            self.store.update(job_id, next_try=deadline)
+        return max(1, math.ceil(deadline - now))
+
+    async def reset_after_flood(self):
+        if not self.store.get("flood_reset_pending", False):
+            return
+        for job in self.store.jobs():
+            if job["recording_kind"]:
+                await self.stop_recording(job, reset=True)
+            if job["stage"] in SENDING or job["circle_state"] == "pending":
+                self.store.reset_gate(job["id"])
+        self.store.set("flood_reset_pending", False)
 
 
     def owned(self, event):
@@ -718,6 +752,9 @@ class Assistant:
 
     async def status(self):
         heading = f"Помощник v{__version__}\n" + ("⏸ Очередь на паузе" if self.store.get("paused", False) else "▶️ Очередь работает")
+        remaining = math.ceil(self.store.get("send_not_before", 0) - time.time())
+        if remaining > 0:
+            heading += f"\n⏳ Ожидание лимита Telegram: осталось {remaining} сек. Продолжу автоматически."
         jobs = self.store.jobs()
         lines = [heading, f"Всего заданий: {len(jobs)}. Последние 20:"]
         for job in jobs[:20]:
@@ -770,6 +807,8 @@ class Assistant:
             self.store.update(job["id"], **changes)
 
     async def reconcile(self, job):
+        if self.store.get("send_not_before", 0) > time.time():
+            return None
         completed = ("second_done", "done", "replied")
         if job["stage"] not in SENDING + WAITING + completed and job["circle_state"] != "pending":
             return
@@ -808,6 +847,8 @@ class Assistant:
         self.wake.set()
 
     async def sync_reads(self, job):
+        if self.store.get("send_not_before", 0) > time.time():
+            return False
         if job["read_target"] <= job["read_done"]:
             return True
         if job["read_next_try"] > time.time():
@@ -820,13 +861,11 @@ class Assistant:
                               read_gate_id=max(job["read_gate_id"], job["read_target"]), read_gate_at=time.time())
             return True
         except Exception as exc:
-            wait = exc.seconds + 1 if isinstance(exc, errors.FloodWaitError) else 30
+            wait = self.defer_for_flood(exc, job["id"]) if isinstance(exc, errors.FloodWaitError) else 30
             reason = error_text(exc)
             self.store.update(job["id"], read_error=reason, read_next_try=time.time() + wait)
-            if isinstance(exc, errors.FloodWaitError):
-                self.store.set("send_not_before", time.time() + wait)
             if reason != job["read_error"]:
-                await self.tell(f"#{job['id']}: не удалось прочитать входящие. Отправку задержал. {reason}")
+                await self.tell(f"#{job['id']}: не удалось прочитать входящие. {reason} Пауза {wait} сек.")
             return False
 
     def read_delay(self, job):
@@ -837,6 +876,8 @@ class Assistant:
         return FOLLOWUP_DELAY if job["stage"] == "followup_pending" else READ_DELAY
 
     async def before_send(self, job, latest_id=None):
+        if self.store.get("send_not_before", 0) > time.time():
+            return False
         if latest_id is None:
             latest = await self.user.get_messages(peer_for(job), limit=1)
             latest_id = latest[0].id if latest else 0
@@ -879,6 +920,8 @@ class Assistant:
             self.store.update(job["id"], notice_pending=0)
 
     async def refresh_recording(self, job_id, *, force=False):
+        if self.store.get("send_not_before", 0) > time.time():
+            return
         async with self.recording_locks[job_id]:
             job = self.store.job(job_id)
             if not job or not job["recording_kind"]:
@@ -902,12 +945,15 @@ class Assistant:
             job = self.store.job(job_id)
             if not job or not job["recording_kind"]:
                 return
+            if self.store.get("send_not_before", 0) > time.time():
+                await asyncio.sleep(RECORD_INTERVAL)
+                continue
             await asyncio.sleep(max(0.05, job["recording_next"] - time.time()))
             try:
                 await self.refresh_recording(job_id)
             except Exception as exc:
                 log.warning("Recording refresh failed for job %s: %s", job_id, type(exc).__name__)
-                wait = exc.seconds + 1 if isinstance(exc, errors.FloodWaitError) else RECORD_INTERVAL
+                wait = self.defer_for_flood(exc) if isinstance(exc, errors.FloodWaitError) else RECORD_INTERVAL
                 await asyncio.sleep(wait)
 
     async def prepare_recording(self, job, kind):
@@ -1016,6 +1062,8 @@ class Assistant:
             return
         if not await self.prepare_recording(self.store.job(job["id"]), "circle"):
             return
+        if self.store.get("send_not_before", 0) > time.time():
+            return
         message_id = await self.copy_saved(self.store.job(job["id"]), "circle")
         self.store.update(job["id"], circle_state="done", circle_message=message_id, error="", next_try=0,
                           archive_pending=1, archive_done=0, archive_next_try=0,
@@ -1074,6 +1122,8 @@ class Assistant:
                 "second_pending": "second"}[job["stage"]]
         if kind != "sticker" and not await self.prepare_recording(self.store.job(job["id"]), kind):
             return
+        if self.store.get("send_not_before", 0) > time.time():
+            return
         if kind == "sticker":
             # A lost acknowledgement must retry the same random_id, even if our message is now in history.
             self.store.update(job["id"], opening_attempted=1)
@@ -1082,6 +1132,8 @@ class Assistant:
 
 
     async def sync_mute(self, job):
+        if self.store.get("send_not_before", 0) > time.time():
+            return
         if not job["mute_pending"] or job["mute_next_try"] > time.time():
             return
         try:
@@ -1097,7 +1149,7 @@ class Assistant:
                 raise ValueError("Telegram пока не подтвердил отключение уведомлений.")
             self.store.update(job["id"], mute_pending=0, mute_done=1, mute_error="", mute_next_try=0)
         except Exception as exc:
-            wait = exc.seconds if isinstance(exc, errors.FloodWaitError) else 30
+            wait = self.defer_for_flood(exc) if isinstance(exc, errors.FloodWaitError) else 30
             reason = error_text(exc)
             self.store.update(job["id"], mute_error=reason, mute_next_try=time.time() + wait + 1)
             if job["mute_error"] != reason:
@@ -1105,6 +1157,8 @@ class Assistant:
 
 
     async def sync_archive(self, job):
+        if self.store.get("send_not_before", 0) > time.time():
+            return
         if not job["archive_pending"] or job["archive_next_try"] > time.time():
             return
         try:
@@ -1119,7 +1173,7 @@ class Assistant:
             self.store.update(job["id"], archive_pending=0, archive_done=1,
                               archive_error="", archive_next_try=0)
         except Exception as exc:
-            wait = exc.seconds if isinstance(exc, errors.FloodWaitError) else 30
+            wait = self.defer_for_flood(exc) if isinstance(exc, errors.FloodWaitError) else 30
             reason = error_text(exc)
             self.store.update(job["id"], archive_error=reason, archive_next_try=time.time() + wait + 1)
             if job["archive_error"] != reason:
@@ -1127,6 +1181,8 @@ class Assistant:
 
 
     async def sync_folder(self, job):
+        if self.store.get("send_not_before", 0) > time.time():
+            return
         if not job["desired_folder"] or job["applied_folder"] == job["desired_folder"]:
             return
         if job["folder_next_try"] > time.time():
@@ -1136,7 +1192,7 @@ class Assistant:
             self.store.update(job["id"], applied_folder=job["desired_folder"],
                               folder_error="", folder_next_try=0)
         except Exception as exc:
-            wait = exc.seconds if isinstance(exc, errors.FloodWaitError) else 60
+            wait = self.defer_for_flood(exc) if isinstance(exc, errors.FloodWaitError) else 60
             reason = error_text(exc)
             self.store.update(job["id"], folder_error=reason, folder_next_try=time.time() + wait)
             if job["folder_error"] != reason:
@@ -1153,14 +1209,14 @@ class Assistant:
                         self.store.update(job["id"], applied_folder=0)
             self.store.set("single_process_folder_layout", True)
         except Exception as exc:
-            wait = exc.seconds + 1 if isinstance(exc, errors.FloodWaitError) else 60
+            wait = self.defer_for_flood(exc) if isinstance(exc, errors.FloodWaitError) else 60
             self.store.set("folder_layout_retry", time.time() + wait)
-            if isinstance(exc, errors.FloodWaitError):
-                self.store.set("send_not_before", time.time() + wait)
             log.warning("Folder migration delayed: %s", type(exc).__name__)
 
 
     async def process_job(self, job_id):
+        if self.store.get("send_not_before", 0) > time.time():
+            return
         job = self.store.job(job_id)
         if not job:
             return
@@ -1175,6 +1231,8 @@ class Assistant:
             await self.sync_archive(self.store.job(job_id))
             await self.sync_folder(self.store.job(job_id))
             job = self.store.job(job_id)
+            if self.store.get("send_not_before", 0) > time.time():
+                return
             if job["stage"] == "voice_forbidden":
                 return
             if self.store.get("paused", False) or job["error"] or job["next_try"] > time.time():
@@ -1199,12 +1257,11 @@ class Assistant:
                 elif isinstance(exc, errors.FloodWaitError):
                     log.warning("Rate limit for job %s: request=%s wait=%s stage=%s", job_id,
                                 type(exc.request).__name__, exc.seconds, self.store.job(job_id)["stage"])
-                    deadline = time.time() + exc.seconds + 1
-                    self.store.update(job_id, next_try=deadline)
-                    self.store.set("send_not_before", deadline)
+                    wait = self.defer_for_flood(exc, job_id)
                     await self.stop_recording(self.store.job(job_id), reset=True)
                     self.store.reset_gate(job_id)
-                    await self.tell(f"#{job_id}: {error_text(exc)} Отправку отложил.")
+                    await self.tell(f"#{job_id}: {error_text(exc)} Выдержу увеличенную паузу {wait} сек. "
+                                    "Отправки и фоновые проверки отложены, затем продолжу автоматически.")
                 elif isinstance(exc, errors.ServerError):
                     await self.temporary_failure(job_id)
                 else:
@@ -1229,8 +1286,19 @@ class Assistant:
             self.store.set("paused", True)
         await self.tell(f"#{job_id}: {error_text(exc)} После устранения причины: /retry {job_id}.")
 
-    async def recover_replies(self):
-        for job in self.store.jobs():
+    async def recover_replies(self, limit=None):
+        if self.store.get("send_not_before", 0) > time.time():
+            return
+        jobs = [job for job in reversed(self.store.jobs())
+                if job["stage"] in WAITING + ("second_pending",) or job["circle_state"] == "pending"
+                or (job["stage"] in ("second_done", "done", "replied") and not job["replied"])]
+        if limit is not None:
+            jobs = [job for job in jobs if job["stage"] == "reply_waiting"
+                    or (job["stage"] in ("second_done", "done", "replied") and not job["replied"])]
+            cursor = self.store.get("history_scan_cursor", 0)
+            jobs = ([job for job in jobs if job["id"] > cursor] +
+                    [job for job in jobs if job["id"] <= cursor])[:limit]
+        for job in jobs:
             completed_waiting = job["stage"] in ("second_done", "done", "replied") and not job["replied"]
             if job["stage"] not in WAITING + ("second_pending",) and job["circle_state"] != "pending" and not completed_waiting:
                 continue
@@ -1240,11 +1308,14 @@ class Assistant:
                     if not job:
                         continue
                     await self.reconcile(job)
+                    self.store.set("history_scan_cursor", job["id"])
                     job = self.store.job(job["id"])
                     if job["stage"] != "second_pending" and job["circle_state"] != "pending":
                         await self.stop_recording(job, reset=True)
                 except errors.FloodWaitError as exc:
-                    self.store.set("send_not_before", time.time() + exc.seconds + 1)
+                    wait = self.defer_for_flood(exc)
+                    await self.tell(f"Telegram ограничил проверку истории. Пауза {wait} сек. "
+                                    "После неё продолжу очередь автоматически.")
                     break
                 except Exception as exc:
                     log.warning("Reply lookup failed: %s", type(exc).__name__)
@@ -1269,21 +1340,23 @@ class Assistant:
                 if job and (job["stage"] in SENDING or job["circle_state"] == "pending"):
                     await self.stop_recording(job, reset=True)
                     self.store.reset_gate(job["id"])
-        await self.recover_replies()
         self.ready = True
         while True:
             self.wake.clear()
             try:
                 if self.user.is_connected():
                     if self.store.get("send_not_before", 0) <= time.time():
+                        await self.reset_after_flood()
                         await self.sync_folder_layout()
-                        if time.monotonic() - self.last_history_scan > 30:
-                            self.last_history_scan = time.monotonic()
-                            await self.recover_replies()
-                        for job in self.store.jobs():
+                        jobs = sorted(self.store.jobs(), key=lambda job: 0 if job["stage"] in SENDING or job["circle_state"] == "pending" else 1)
+                        for job in jobs:
                             if self.store.get("send_not_before", 0) > time.time():
                                 break
                             await self.process_job(job["id"])
+                        if (self.store.get("send_not_before", 0) <= time.time()
+                                and self.store.get("history_scan_next", 0) <= time.time()):
+                            self.store.set("history_scan_next", time.time() + HISTORY_RECHECK_INTERVAL)
+                            await self.recover_replies(limit=1)
             except Exception as exc:
                 log.warning("Worker iteration failed: %s", type(exc).__name__)
             try:
