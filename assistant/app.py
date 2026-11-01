@@ -15,6 +15,7 @@ from telethon import Button, errors, events, functions, types
 from . import __version__
 from .folders import Folders, NAMES
 from .store import validate_opening_text
+from .recipients import eligible, identity, load_directory, recipient_label, recipient_link
 
 
 log = logging.getLogger(__name__)
@@ -27,20 +28,21 @@ FLOOD_MAX_WAIT = 1800
 HISTORY_RECHECK_INTERVAL = 15
 MUTE_FOREVER = 2**31 - 1
 SCENARIO = "Текст или стикер + ГС1 + ГС2 + ГС3"
-VOICE_MODES = {"two_voice": "Старый: ГС1; ГС3 вручную по username",
-               "three_voice": "Новый: ГС1 + ГС2 подряд; ГС3 вручную по username"}
+VOICE_MODES = {"two_voice": "Старый: ГС1; ГС3 вручную по username или выбору чата",
+               "three_voice": "Новый: ГС1 + ГС2 подряд; ГС3 вручную по username или выбору чата"}
 MENU = [[Button.text("⚙️ Настройка"), Button.text("📋 Статус")],
         [Button.text("⏸ Пауза"), Button.text("▶️ Продолжить")],
         [Button.text("📨 Очередь"), Button.text("❌ Отменить отправку")],
         [Button.text("🎙 Отправить ГС3")],
+        [Button.text("👤 Выбрать чат")],
         [Button.text("📹 Отправить подтверждающий кружок")]]
 SENDING = ("sticker_pending", "voice_pending", "followup_pending", "second_pending")
 WAITING = ("reply_waiting", "second_confirmation")
 STAGES = {"awaiting_confirmation": "вы уже писали этому человеку: требуется подтверждение",
           "sticker_pending": "ожидает первого сообщения", "voice_pending": "ожидает ГС1",
           "followup_pending": "ГС1 отправлено, готовится ГС2",
-          "reply_waiting": "начальные ГС отправлены; ГС3 вручную по username",
-          "second_confirmation": "ответ получен; ГС3 отправляется вручную по username",
+          "reply_waiting": "начальные ГС отправлены; ГС3 вручную по username или выбору чата",
+          "second_confirmation": "ответ получен; ГС3 отправляется вручную по username или выбору чата",
           "second_pending": "подтверждено: готовится ГС3", "second_done": "ГС3 отправлено",
           "voice_forbidden": "голосовые запрещены: отправки остановлены",
           "done": "отправки завершены", "replied": "получен ответ", "cancelled": "отменено"}
@@ -56,7 +58,7 @@ def cancel_button(job):
 
 
 def circle_button(job, *, show_username=False):
-    title = f"📹 Кружок для @{job['username']}" if show_username else "📹 Отправить подтверждающий кружок"
+    title = f"📹 Кружок для {recipient_label(job)}" if show_username else "📹 Отправить подтверждающий кружок"
     return Button.inline(title, f"send_circle:{job['id']}:{job['circle_token']}".encode())
 
 
@@ -126,6 +128,7 @@ class Assistant:
         self.folders = Folders(user)
         self.locks = defaultdict(asyncio.Lock)
         self.queue_lock = asyncio.Lock()
+        self.chat_picker_lock = asyncio.Lock()
         self.recording_tasks = {}
         self.recording_locks = defaultdict(asyncio.Lock)
         self.ready = False
@@ -179,6 +182,124 @@ class Assistant:
     def owned(self, event):
         return event.is_private and event.sender_id == self.owner_id
 
+    async def open_chat_picker(self, *, refresh=False):
+        contacts = await load_directory(self, force=refresh)
+        self.store.set("mode", None)
+        state = {"token": secrets.token_hex(8), "expires": time.time() + 600,
+                 "contacts": contacts, "query": "", "page": 0, "selected": None}
+        self.store.set("chat_picker", state)
+        await self.show_chat_picker(state)
+
+    def picker_state(self, token):
+        state = self.store.get("chat_picker")
+        if not state or state["token"] != token or state["expires"] <= time.time():
+            raise ValueError("Этот список устарел. Нажмите «👤 Выбрать чат» заново.")
+        return state
+
+    async def show_chat_picker(self, state):
+        query = state["query"].casefold()
+        matches = [(index, person) for index, person in enumerate(state["contacts"])
+                   if query in f"{person['display_name']} {person['username']} {person['user_id']}".casefold()]
+        pages = max(1, math.ceil(len(matches) / 8))
+        state["page"] = max(0, min(state["page"], pages - 1))
+        state["selected"] = None
+        token = state["token"]
+        buttons = []
+        for index, person in matches[state["page"] * 8:(state["page"] + 1) * 8]:
+            name = person["display_name"] or recipient_label(person)
+            detail = "@" + person["username"] if person["username"] else f"ID {person['user_id']}"
+            buttons.append([Button.inline(f"{name[:35]} · {detail}"[:64], f"chat_pick:{token}:{index}".encode())])
+        navigation = []
+        if state["page"]:
+            navigation.append(Button.inline("←", f"chat_page:{token}:{state['page'] - 1}".encode()))
+        if state["page"] + 1 < pages:
+            navigation.append(Button.inline("→", f"chat_page:{token}:{state['page'] + 1}".encode()))
+        if navigation:
+            buttons.append(navigation)
+        buttons += [[Button.inline("🔎 Найти по имени", f"chat_search:{token}".encode())],
+                    [Button.inline("Обновить список", f"chat_refresh:{token}".encode()),
+                     Button.inline("Сбросить поиск", f"chat_reset:{token}".encode())],
+                    [Button.inline("Закрыть", f"chat_close:{token}".encode())]]
+        self.store.set("chat_picker", state)
+        text = (f"Личные чаты: {len(matches)}. Страница {state['page'] + 1}/{pages}.\n"
+                "Выберите человека; затем появятся действия. Выбор сам по себе ничего не отправляет.")
+        if state["query"]:
+            text += f"\nПоиск: {state['query']}"
+        if not matches:
+            text += "\nСовпадений нет. Сбросьте поиск или обновите список, если человек написал недавно."
+        await self.tell(text, buttons=buttons)
+
+    async def chat_picker_callback(self, data):
+        async with self.chat_picker_lock:
+            if data == "chat_open":
+                await self.open_chat_picker()
+                return
+            parts = data.split(":")
+            state = self.picker_state(parts[1])
+            action = parts[0]
+            if action == "chat_close":
+                self.store.set("chat_picker", None)
+                self.store.set("mode", None)
+                await self.tell("Выбор чата закрыт.", buttons=MENU)
+            elif action == "chat_refresh":
+                await self.open_chat_picker(refresh=True)
+            elif action == "chat_search":
+                self.store.set("mode", "chat_search")
+                await self.tell("Пришлите имя или часть имени человека в ваших личных чатах. "
+                                "Можно искать по username или ID. /cancel — выйти.")
+            elif action in ("chat_page", "chat_reset"):
+                state["page"] = int(parts[2]) if action == "chat_page" else 0
+                if action == "chat_reset":
+                    state["query"] = ""
+                self.store.set("mode", None)
+                await self.show_chat_picker(state)
+            elif action == "chat_pick":
+                index = int(parts[2])
+                if not 0 <= index < len(state["contacts"]):
+                    raise ValueError("Чат не найден. Обновите список.")
+                person = state["contacts"][index]
+                state["selected"] = index
+                self.store.set("chat_picker", state)
+                self.store.set("mode", None)
+                prefix = f"chat_action:{state['token']}:{index}:"
+                buttons = [[Button.inline("🎙 Отправить ГС3", (prefix + "third").encode())],
+                           [Button.inline("▶️ Начать сценарий", (prefix + "start").encode())]]
+                if recipient_link(person):
+                    buttons.insert(0, [Button.url("Открыть переписку", recipient_link(person))])
+                if self.store.by_user(person["user_id"]):
+                    buttons += [[Button.inline("📹 Отправить кружок", (prefix + "circle").encode())],
+                                [Button.inline("❌ Отменить отправку", (prefix + "cancel").encode())]]
+                buttons.append([Button.inline("← К списку", f"chat_page:{state['token']}:{state['page']}".encode())])
+                await self.tell(f"Выбран: {person['display_name'] or recipient_label(person)}\n"
+                                f"{recipient_label(person)} · ID {person['user_id']}\n"
+                                "Проверьте человека и выберите действие.", buttons=buttons)
+            elif action == "chat_action":
+                index = int(parts[2])
+                operation = parts[3]
+                if state["selected"] != index or not 0 <= index < len(state["contacts"]):
+                    raise ValueError("Сначала выберите человека в актуальном списке.")
+                if operation not in ("third", "start", "circle", "cancel"):
+                    raise ValueError("Неизвестное действие с чатом.")
+                wait = self.store.get("send_not_before", 0) - time.time()
+                if operation != "cancel" and wait > 0:
+                    raise ValueError(f"Telegram на паузе ещё {math.ceil(wait)} сек. Повторите после ожидания.")
+                person = state["contacts"][index]
+                self.store.set("chat_picker", None)
+                self.store.set("mode", None)
+                peer = types.InputPeerUser(person["user_id"], person["access_hash"])
+                if operation == "third":
+                    await self.request_third_target(peer)
+                elif operation == "start":
+                    await self.add_target(peer)
+                else:
+                    job = self.store.by_user(person["user_id"])
+                    if not job:
+                        raise ValueError("Для этого чата нет задания. Сначала начните сценарий или отправьте ГС3.")
+                    if operation == "circle":
+                        await self.request_circle(job["id"], job["circle_token"])
+                    else:
+                        await self.job_action("/cancel", job["id"])
+
 
     async def settings(self):
         mode = self.store.get("voice_send_mode", "two_voice")
@@ -225,6 +346,9 @@ class Assistant:
         if not self.owned(event):
             return
         text = (event.raw_text or "").strip()
+        menu_texts = {button.button.text for row in MENU for button in row}
+        if self.store.get("mode") != "chat_search" or text.startswith("/") or text in menu_texts:
+            self.store.set("chat_picker", None)
         try:
             if text in ("/start", "/help"):
                 self.store.set("mode", None)
@@ -233,6 +357,7 @@ class Assistant:
                                 "Выберите старый или новый режим. В новом режиме после ГС1 "
                                 "прочитаю входящие, подожду 1 секунду и покажу запись ГС2.\n"
                                 "Пришлите @username. Перед отправками прочитаю входящие и подожду 3 секунды (перед ГС1 и ГС2 — 1 секунду). "
+                                "Если username нет: «👤 Выбрать чат» → поиск по имени → человек → нужное действие.\n"
                                 "Перед каждым ГС покажу индикатор записи на его длительность.\n"
                                 "ГС3 отправляется вручную: нажмите «🎙 Отправить ГС3» и пришлите username. "
                                 "Откройте чат, ответьте человеку, затем нажмите кнопку.\n"
@@ -255,14 +380,19 @@ class Assistant:
                 await self.queue_menu()
             elif text in ("🎙 Отправить ГС3", "/gs3"):
                 await self.prompt_third_target()
+            elif text in ("👤 Выбрать чат", "/chats"):
+                async with self.chat_picker_lock:
+                    await self.open_chat_picker()
             elif text == "📹 Отправить подтверждающий кружок":
                 self.store.set("mode", "circle_target")
                 await self.tell("Пришлите @username из очереди, которому отправить кружок для подтверждения личности. "
-                                "Можно прислать ссылку t.me/username. /cancel — отменить ввод.")
+                                "Можно прислать ссылку t.me/username. Без username: выберите чат по имени. /cancel — отменить ввод.",
+                                buttons=[[Button.inline("👤 Выбрать чат по имени", b"chat_open")]])
             elif text == "❌ Отменить отправку":
                 self.store.set("mode", "cancel_target")
                 await self.tell("Пришлите @username, для которого нужно отменить все дальнейшие отправки. "
-                                "Можно прислать ссылку t.me/username. /cancel — выйти из отмены.")
+                                "Можно прислать ссылку t.me/username. Без username: выберите чат по имени. /cancel — выйти из отмены.",
+                                buttons=[[Button.inline("👤 Выбрать чат по имени", b"chat_open")]])
             elif text in ("⏸ Пауза", "/pause"):
                 self.store.set("paused", True)
                 for job in self.store.jobs():
@@ -282,6 +412,13 @@ class Assistant:
             elif text == "/cancel":
                 self.store.set("mode", None)
                 await self.tell("Ввод отменён. Для отмены задания: «❌ Отменить отправку» или /cancel ID.", buttons=MENU)
+            elif self.store.get("mode") == "chat_search" and not text.startswith("/"):
+                async with self.chat_picker_lock:
+                    state = self.store.get("chat_picker")
+                    state = self.picker_state(state["token"] if state else "")
+                    state.update(query=text[:100], page=0)
+                    self.store.set("mode", None)
+                    await self.show_chat_picker(state)
             elif self.store.get("mode") == "cancel_target" and not text.startswith("/"):
                 username = parse_username(text)
                 if not username:
@@ -322,10 +459,15 @@ class Assistant:
                 if username:
                     await self.add_target(username)
                 else:
-                    await self.tell("Пришлите @username или нажмите «⚙️ Настройка».", buttons=MENU)
+                    await self.tell("Пришлите @username, выберите человека через «👤 Выбрать чат» "
+                                    "или нажмите «⚙️ Настройка».", buttons=MENU)
         except Exception as exc:
             log.warning("Bot command failed: %s", type(exc).__name__)
-            await self.tell(error_text(exc))
+            if isinstance(exc, errors.FloodWaitError):
+                wait = self.defer_for_flood(exc)
+                await self.tell(f"Telegram ограничил запрос. Выдержу паузу {wait} сек. Затем повторите действие.")
+            else:
+                await self.tell(error_text(exc))
         finally:
             self.wake.set()
 
@@ -336,7 +478,11 @@ class Assistant:
         await event.answer()
         try:
             data = event.data.decode()
-            if data == "settings":
+            if not data.startswith("chat_"):
+                self.store.set("chat_picker", None)
+            if data.startswith("chat_"):
+                await self.chat_picker_callback(data)
+            elif data == "settings":
                 self.store.set("mode", None)
                 await self.settings()
             elif data == "scenario:two_voice":
@@ -406,7 +552,11 @@ class Assistant:
                 await self.tell("Эта кнопка устарела. Откройте /settings или /status.")
         except Exception as exc:
             log.warning("Settings failed: %s", type(exc).__name__)
-            await self.tell(error_text(exc))
+            if isinstance(exc, errors.FloodWaitError):
+                wait = self.defer_for_flood(exc)
+                await self.tell(f"Telegram ограничил запрос. Выдержу паузу {wait} сек. Затем повторите действие.")
+            else:
+                await self.tell(error_text(exc))
         finally:
             self.wake.set()
 
@@ -484,8 +634,8 @@ class Assistant:
         followup_source = sources.get("followup")
         followup_duration = voice_duration(media["followup"]) if dialogue_mode == "three_voice" else None
         person = await self.user.get_entity(username)
-        if not isinstance(person, types.User) or person.bot or person.is_self or person.deleted:
-            raise ValueError("Нужен username обычного пользователя.")
+        if not eligible(person):
+            raise ValueError("Нужен личный чат с обычным пользователем.")
         async with self.locks[person.id]:
             existing = self.store.by_user(person.id)
             if existing:
@@ -493,7 +643,7 @@ class Assistant:
                     await self.request_confirmation(existing)
                     return
                 token = self.store.request_repeat(existing["id"], dict(
-                    user_id=person.id, access_hash=person.access_hash, username=person.username or username,
+                    **identity(person),
                     sticker_source=sources.get("sticker", 0), voice_source=sources["voice"], second_source=sources["second"],
                     first_duration=first_duration, second_duration=second_duration,
                     opening_kind=opening_kind, opening_text=opening_text,
@@ -503,7 +653,7 @@ class Assistant:
             latest = await self.user.get_messages(person, limit=1)
             baseline = latest[0].id if latest else 0
             previous = await self.previous_outgoing(person)
-            job = self.store.add(user_id=person.id, access_hash=person.access_hash, username=person.username or username,
+            job = self.store.add(**identity(person),
                                  sticker_source=sources.get("sticker", 0), voice_source=sources["voice"], second_source=sources["second"],
                                  baseline=baseline, first_duration=first_duration, second_duration=second_duration,
                                  opening_kind=opening_kind, opening_text=opening_text,
@@ -512,7 +662,7 @@ class Assistant:
         if previous:
             await self.request_confirmation(job)
         else:
-            await self.tell(f"Задание #{job['id']} для @{job['username']} принято. {VOICE_MODES[job['dialogue_mode']]}. "
+            await self.tell(f"Задание #{job['id']} для {recipient_label(job)} принято. {VOICE_MODES[job['dialogue_mode']]}. "
                             "Сначала проверю запрет голосовых и прочитаю входящие.",
                             buttons=[[cancel_button(job)], [circle_button(job)]])
 
@@ -527,7 +677,7 @@ class Assistant:
     async def notify_repeat(self, job, token):
         request = self.store.repeat_request(job["id"])
         mode = json.loads(request["payload"]).get("dialogue_mode", "two_voice") if request else "two_voice"
-        await self.tell(f"⚠️ @{job['username']} уже добавлен(а). Задание #{job['id']}.\n"
+        await self.tell(f"⚠️ {recipient_label(job)} уже добавлен(а). Задание #{job['id']}.\n"
                         f"Подтвердите повтор: заново отправить первое сообщение и начальные ГС. {VOICE_MODES[mode]}.\n"
                         "ГС3 потребует нового ответа после начальных ГС и отдельной кнопки «Отправить ГС3».\n"
                         "Подтверждение заменит текущее задание новым циклом.",
@@ -571,12 +721,12 @@ class Assistant:
             await self.stop_recording(job, reset=True)
             new = self.store.restart(job_id, token, baseline)
             if new:
-                await self.tell(f"Повтор для @{new['username']} подтверждён. Новое задание #{new['id']}. "
+                await self.tell(f"Повтор для {recipient_label(new)} подтверждён. Новое задание #{new['id']}. "
                                 "Сначала прочитаю входящие и подожду 3 секунды.")
 
 
     async def request_confirmation(self, job):
-        await self.tell(f"⚠️ Вы уже писали @{job['username']}. Задание #{job['id']}.\n"
+        await self.tell(f"⚠️ Вы уже писали {recipient_label(job)}. Задание #{job['id']}.\n"
                         f"Подтвердите начало сценария: {'текст' if job['opening_kind'] == 'text' else 'стикер'} → {VOICE_MODES[job['dialogue_mode']]}.",
                         buttons=[[Button.inline("Подтвердить начало", f"confirm:{job['id']}".encode())],
                                  [Button.inline("Отмена", f"dismiss:{job['id']}".encode())]])
@@ -603,7 +753,9 @@ class Assistant:
     async def prompt_third_target(self):
         self.store.set("mode", "third_target")
         await self.tell("Пришлите @username или ссылку t.me/username, кому отправить ГС3. "
-                        "Это сразу поставит выбранное ГС3 на отправку с анимацией записи. /cancel — выйти.")
+                        "Это сразу поставит выбранное ГС3 на отправку с анимацией записи. "
+                        "Если username нет, нажмите «Выбрать чат по имени», выберите человека, затем «Отправить ГС3». /cancel — выйти.",
+                        buttons=[[Button.inline("👤 Выбрать чат по имени", b"chat_open")]])
 
     async def request_third_target(self, username):
         if not self.ready:
@@ -613,8 +765,8 @@ class Assistant:
             raise ValueError("Сначала в настройках нажмите «Задать ГС3» и пришлите голосовое.")
         duration = voice_duration(await self.user.get_messages("me", ids=source))
         person = await self.user.get_entity(username)
-        if not isinstance(person, types.User) or person.bot or person.is_self or person.deleted:
-            raise ValueError("Нужен username обычного пользователя.")
+        if not eligible(person):
+            raise ValueError("Нужен личный чат с обычным пользователем.")
         async with self.locks[person.id]:
             job = self.store.by_user(person.id)
             if job and ((job["circle_state"] == "pending" and job["stage"] not in WAITING) or job["stage"] in
@@ -622,7 +774,7 @@ class Assistant:
                 raise ValueError("У этого пользователя ещё готовятся начальные сообщения или кружок. Дождитесь их отправки.")
             if job and job["stage"] == "second_pending" and job["second_send_approved"]:
                 self.store.set("mode", None)
-                await self.tell(f"ГС3 для @{job['username']} уже поставлено на отправку. Повтор не создан.")
+                await self.tell(f"ГС3 для {recipient_label(job)} уже поставлено на отправку. Повтор не создан.")
                 return
             if job and job["stage"] in WAITING + ("second_pending",):
                 if job["circle_state"] != "pending":
@@ -630,17 +782,17 @@ class Assistant:
                 self.store.update(job["id"], stage="second_pending", second_send_approved=1,
                                   second_source=source, second_duration=duration, second_random=secrets.randbits(63),
                                   second_message=None, second_token=job["second_token"] + 1, error="", next_try=0,
-                                  access_hash=person.access_hash, username=person.username or username)
+                                  access_hash=person.access_hash, username=person.username or "",
+                                  display_name=identity(person)["display_name"])
                 if job["circle_state"] != "pending":
                     self.store.reset_gate(job["id"])
                 job = self.store.job(job["id"])
             else:
                 latest = await self.user.get_messages(person, limit=1)
-                job = self.store.add_manual_third(user_id=person.id, access_hash=person.access_hash,
-                                                  username=person.username or username, source=source,
+                job = self.store.add_manual_third(**identity(person), source=source,
                                                   duration=duration, baseline=latest[0].id if latest else 0)
             self.store.set("mode", None)
-            await self.tell(f"#{job['id']} @{job['username']}: ГС3 поставлено на отправку. "
+            await self.tell(f"#{job['id']} {recipient_label(job)}: ГС3 поставлено на отправку. "
                             "Прочитаю входящие, подожду 3 секунды, покажу запись и отправлю голосовое.",
                             buttons=[[cancel_button(job)]])
         self.wake.set()
@@ -678,8 +830,9 @@ class Assistant:
                     if (not job or job["stage"] != "second_confirmation" or job["desired_folder"] != 2
                             or job["applied_folder"] != 2 or job["second_send_approved"]):
                         continue
-                    if not await self.tell(f"@{job['username']} · задание #{job['id']}",
-                                           buttons=[[Button.url("Открыть переписку", f"https://t.me/{job['username']}")]]):
+                    button = (Button.url("Открыть переписку", recipient_link(job)) if recipient_link(job)
+                              else Button.inline("👤 Выбрать чат по имени", b"chat_open"))
+                    if not await self.tell(f"{recipient_label(job)} · задание #{job['id']}", buttons=[[button]]):
                         await self.tell(f"Отправлено запросов: {sent}. Доставка прервалась; повторите через «Очередь» позже.")
                         return
                     sent += 1
@@ -715,7 +868,7 @@ class Assistant:
             self.store.update(job_id, circle_state="pending", circle_source=source, circle_duration=duration,
                               circle_random=secrets.randbits(63), circle_message=None, circle_token=token + 1)
             self.store.reset_gate(job_id)
-            await self.tell(f"#{job_id} @{job['username']}: отправка кружка подтверждена. "
+            await self.tell(f"#{job_id} {recipient_label(job)}: отправка кружка подтверждена. "
                             "Прочитаю входящие, подожду 3 секунды и покажу запись видеосообщения перед отправкой.",
                             buttons=[[cancel_button(job)]])
 
@@ -738,7 +891,7 @@ class Assistant:
                                   second_token=job["second_token"] + 1, read_target=job["read_done"],
                                   circle_state="cancelled", circle_token=job["circle_token"] + 1,
                                   read_gate_id=-1, read_gate_at=None, due=None, next_try=0)
-                await self.tell(f"#{job_id} @{job['username']}: дальнейшие отправки отменены. "
+                await self.tell(f"#{job_id} {recipient_label(job)}: дальнейшие отправки отменены. "
                                 "Уже отправленные сообщения остаются в чате.", buttons=MENU)
             else:
                 if job["stage"] in ("cancelled", "voice_forbidden") or (
@@ -758,7 +911,7 @@ class Assistant:
         jobs = self.store.jobs()
         lines = [heading, f"Всего заданий: {len(jobs)}. Последние 20:"]
         for job in jobs[:20]:
-            line = f"#{job['id']} @{job['username']} — {STAGES.get(job['stage'], job['stage'])}"
+            line = f"#{job['id']} {recipient_label(job)} — {STAGES.get(job['stage'], job['stage'])}"
             if job["opening_kind"] == "text":
                 line += "; первое сообщение: текст"
             if job["circle_state"]:
@@ -915,7 +1068,7 @@ class Assistant:
         if not job["notice_pending"] or job["notice_try"] > time.time():
             return
         self.store.update(job["id"], notice_try=time.time() + 30)
-        if await self.tell(f"⚠️ @{job['username']} не принимает голосовые. Задание #{job['id']} остановлено. "
+        if await self.tell(f"⚠️ {recipient_label(job)} не принимает голосовые. Задание #{job['id']} остановлено. "
                            "Дальнейших сообщений этому человеку не отправляю."):
             self.store.update(job["id"], notice_pending=0)
 
@@ -1038,10 +1191,10 @@ class Assistant:
         label = {"sticker": "стикер", "voice": "ГС1", "followup": "ГС2", "second": "ГС3"}[kind]
         if kind == "sticker" and job["opening_kind"] == "text":
             label = "первое текстовое сообщение"
-        await self.tell(f"#{job['id']}: {label} отправлено @{job['username']}."
+        await self.tell(f"#{job['id']}: {label} отправлено {recipient_label(job)}."
                         + (" Готовлю ГС2: чтение входящих → пауза 1 секунда → запись."
                            if kind == "voice" and job["dialogue_mode"] == "three_voice" else
-                           " После ответа чат попадёт в «В процессе». ГС3 отправляется кнопкой и username." if kind in ("voice", "followup") else ""),
+                           " После ответа чат попадёт в «В процессе». ГС3 отправляется кнопкой по username или через «Выбрать чат»." if kind in ("voice", "followup") else ""),
                         buttons=[[cancel_button(job)], [circle_button(job)]] if kind != "second" else [[circle_button(job)]])
 
     async def send_circle_step(self, job):
@@ -1070,7 +1223,7 @@ class Assistant:
                           mute_pending=1, mute_done=0, mute_next_try=0)
         await self.stop_recording(self.store.job(job["id"]), reset=True)
         self.store.reset_gate(job["id"])
-        await self.tell(f"#{job['id']}: подтверждающий кружок отправлен @{job['username']}.",
+        await self.tell(f"#{job['id']}: подтверждающий кружок отправлен {recipient_label(job)}.",
                         buttons=[[cancel_button(job)], [circle_button(self.store.job(job["id"]))]])
 
     async def send_step(self, job):

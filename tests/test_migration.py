@@ -8,6 +8,19 @@ from assistant.store import Store
 
 
 class MigrationTests(unittest.TestCase):
+    def test_add_display_name_to_existing_queue_preserves_approvals_and_random_ids(self):
+        self.store = Store(self.path)
+        job = self.store.add_manual_third(user_id=123, access_hash=55, username='alice',
+                                          source=12, duration=11, baseline=100)
+        original = dict(job)
+        self.store.db.execute('ALTER TABLE jobs DROP COLUMN display_name')
+        self.store.db.commit()
+        self.store.close()
+        self.store = Store(self.path)
+        migrated = dict(self.store.job(job['id']))
+        self.assertEqual(migrated['display_name'], '')
+        self.assertEqual(migrated, original)
+
     def test_folder_migration_clears_first_stage_without_revoking_approved_voice(self):
         self.store = Store(self.path)
         job = self.store.add(user_id=123, access_hash=55, username='alice', sticker_source=10,

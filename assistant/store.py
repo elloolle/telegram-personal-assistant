@@ -14,6 +14,7 @@ def validate_opening_text(text):
 
 
 COLUMNS = {
+    'display_name': "TEXT NOT NULL DEFAULT ''",
     'manual_third_only': 'INTEGER NOT NULL DEFAULT 0',
     'voice_delay': 'REAL',
     'desired_folder': 'INTEGER NOT NULL DEFAULT 0',
@@ -160,7 +161,7 @@ class Store:
     def _insert_job(self, *, user_id, access_hash, username, sticker_source, voice_source, second_source,
             baseline, first_duration=None, second_duration=None, stage='sticker_pending', history_checked=False,
             dialogue_mode='two_voice', followup_source=None, followup_duration=None,
-            opening_kind='sticker', opening_text=''):
+            opening_kind='sticker', opening_text='', display_name=''):
         if stage not in ('sticker_pending', 'awaiting_confirmation') or not second_source:
             raise ValueError('Задайте первое сообщение, ГС1 и ГС3.')
         if opening_kind not in ('sticker', 'text'):
@@ -180,13 +181,13 @@ class Store:
                 INSERT INTO jobs (user_id, access_hash, username, sticker_source, voice_source,
                   second_source, sticker_random, voice_random, second_random, baseline, started,
                   cancel_on_reply, dialogue_mode, first_duration, second_duration, stage, history_checked,
-                  followup_source, followup_duration, followup_random, opening_kind, opening_text)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  followup_source, followup_duration, followup_random, opening_kind, opening_text, display_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (user_id, access_hash, username, sticker_source, voice_source, second_source,
                   secrets.randbits(63), secrets.randbits(63), secrets.randbits(63), baseline,
                   time.time(), dialogue_mode, first_duration, second_duration, stage, int(history_checked),
                   followup_source, followup_duration, secrets.randbits(63), opening_kind,
-                  opening_text if opening_kind == 'text' else ''))
+                  opening_text if opening_kind == 'text' else '', display_name))
         return cursor.lastrowid
 
     def request_repeat(self, job_id, payload):
@@ -229,7 +230,7 @@ class Store:
     def by_username(self, username):
         return self.db.execute('SELECT * FROM jobs WHERE username = ? COLLATE NOCASE', (username,)).fetchone()
 
-    def add_manual_third(self, *, user_id, access_hash, username, source, duration, baseline):
+    def add_manual_third(self, *, user_id, access_hash, username, source, duration, baseline, display_name=''):
         if not source or duration < 0 or not math.isfinite(duration):
             raise ValueError('Задайте ГС3 с корректной длительностью.')
         with self.db:
@@ -245,10 +246,10 @@ class Store:
                 INSERT INTO jobs (user_id, access_hash, username, sticker_source, voice_source,
                     sticker_random, voice_random, baseline, started, stage, cancel_on_reply,
                     second_source, second_duration, second_random, second_baseline,
-                    second_send_approved, second_token, history_checked, history_confirmed, manual_third_only)
-                VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, 'second_pending', 0, ?, ?, ?, ?, 1, 1, 1, 1, 1)
+                    second_send_approved, second_token, history_checked, history_confirmed, manual_third_only, display_name)
+                VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?, 'second_pending', 0, ?, ?, ?, ?, 1, 1, 1, 1, 1, ?)
             ''', (user_id, access_hash, username, secrets.randbits(63), secrets.randbits(63), baseline,
-                  time.time(), source, duration, secrets.randbits(63), baseline))
+                  time.time(), source, duration, secrets.randbits(63), baseline, display_name))
         return self.job(cursor.lastrowid)
 
     def jobs(self):
